@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import scrolledtext, messagebox, ttk
+from tkinter import scrolledtext, messagebox
 import threading
 import queue
 import time
@@ -16,8 +16,7 @@ from PIL import Image, ImageDraw
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# --- 1. DPI SCALING FIX (CRITICAL FOR WINDOWS) ---
-# This forces Python to recognize your monitor's real 4K/2K resolution
+# --- 1. DPI SCALING FIX ---
 try:
     if platform.system() == "Windows":
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -25,7 +24,7 @@ except Exception:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
     except:
-        pass # Not on Windows or failed, continue safely
+        pass 
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -71,7 +70,7 @@ class AgentWorker:
         self.ocr = text_brain
         self.stop_flag = False
         
-        # Get Screen Size (Now DPI Aware)
+        # Get Screen Size (DPI Aware)
         self.screen_w, self.screen_h = pyautogui.size()
         self.log(f"🖥️ Monitor Resolution: {self.screen_w}x{self.screen_h}", "system")
 
@@ -98,8 +97,6 @@ class AgentWorker:
         screenshot = pyautogui.screenshot()
         img_w, img_h = screenshot.size
         
-        # --- SCALING CHECK ---
-        # If screenshot is bigger than screen size (Retina/HighDPI), we must know the ratio.
         self.scale_x = img_w / self.screen_w
         self.scale_y = img_h / self.screen_h
         
@@ -200,72 +197,88 @@ class AgentWorker:
             for tool in msg.tool_calls:
                 if self.stop_flag: break
                 
-                args = json.loads(tool.function.arguments)
-                act = args.get("action")
-                thought = args.get("thought", "")
+                # --- FIX: ROBUST ERROR HANDLING ---
+                # We initialize default values so we can ALWAYS report back to OpenAI
+                # even if parsing fails. This prevents the 400 error.
+                act = "unknown"
+                res_txt = "Action failed."
+                args = {}
                 
-                self.log(f"💭 {thought}", "thought")
-                self.log(f"⚡ {act.upper()}", "action")
+                try:
+                    args = json.loads(tool.function.arguments)
+                    act = args.get("action")
+                    thought = args.get("thought", "")
+                    
+                    self.log(f"💭 {thought}", "thought")
+                    self.log(f"⚡ {act.upper()}", "action")
 
-                res_txt = "Action Done."
+                    # Execute Action
+                    if act == "task_finished":
+                        self.log(f"✅ Finished: {args.get('reason')}", "success")
+                        self.stop_flag = True
+                        res_txt = "Task finished."
 
-                if act == "task_finished":
-                    self.log(f"✅ Finished: {args.get('reason')}", "success")
-                    self.stop_flag = True
-                    break
+                    elif act == "click_coordinate":
+                        xp, yp = args.get("x_pct"), args.get("y_pct")
+                        if xp is not None:
+                            real_x = int(xp * self.screen_w)
+                            real_y = int(yp * self.screen_h)
+                            self.log(f"🖱️ Aiming at {real_x},{real_y}...", "normal")
+                            pyautogui.moveTo(real_x, real_y, duration=0.5) 
+                            pyautogui.click()
+                            res_txt = "Clicked."
+                        else:
+                            res_txt = "Error: Coordinates missing."
 
-                elif act == "click_coordinate":
-                    xp, yp = args.get("x_pct"), args.get("y_pct")
-                    if xp is not None:
-                        # --- SCALING FIX ---
-                        # We multiply percentage by SCREEN size, not Image size.
-                        real_x = int(xp * self.screen_w)
-                        real_y = int(yp * self.screen_h)
-                        
-                        # VISUAL DEBUG: Move mouse slowly so you can see where it aims
-                        self.log(f"🖱️ Aiming at {real_x},{real_y}...", "normal")
-                        pyautogui.moveTo(real_x, real_y, duration=0.5) 
-                        pyautogui.click()
-                        self.log(f"🖱️ CLICKED!", "success")
-                    else:
-                        res_txt = "Error: Coordinates missing."
+                    elif act == "type_text":
+                        text_to_type = args.get("text", "")
+                        pyautogui.write(text_to_type, interval=0.05)
+                        self.log(f"⌨️ Type: {text_to_type}", "normal")
+                        res_txt = "Typed text."
 
-                elif act == "type_text":
-                    pyautogui.write(args.get("text"), interval=0.05)
-                    self.log(f"⌨️ Type: {args.get('text')}", "normal")
+                    elif act == "press_key":
+                        k = args.get("key", "").lower()
+                        if k in KEY_MAP: k = KEY_MAP[k]
+                        pyautogui.press(k)
+                        self.log(f"🎹 Press: {k}", "normal")
+                        res_txt = f"Pressed {k}."
 
-                elif act == "press_key":
-                    k = args.get("key", "").lower()
-                    if k in KEY_MAP: k = KEY_MAP[k]
-                    pyautogui.press(k)
-                    self.log(f"🎹 Press: {k}", "normal")
+                    elif act == "scroll":
+                        pyautogui.scroll(args.get("amount", -500))
+                        res_txt = "Scrolled."
 
-                elif act == "scroll":
-                    pyautogui.scroll(args.get("amount", -500))
+                    elif act == "use_ocr_backup":
+                        txt = args.get("text")
+                        matches = self.ocr.find_text(txt, "debug_grid.png")
+                        if matches:
+                            img_x, img_y = matches[0]
+                            final_x = int(img_x / self.scale_x)
+                            final_y = int(img_y / self.scale_y)
+                            pyautogui.moveTo(final_x, final_y, duration=0.5)
+                            pyautogui.click()
+                            res_txt = f"OCR clicked '{txt}'"
+                        else:
+                            res_txt = "OCR found nothing."
+                        self.log(res_txt, "normal")
+                
+                except json.JSONDecodeError:
+                    # If JSON fails, we record the error but DO NOT crash the loop
+                    self.log(f"⚠️ JSON Parse Error on tool call.", "error")
+                    res_txt = "Error: Invalid JSON format generated by AI. Please retry."
+                except Exception as e:
+                    self.log(f"⚠️ Action Error: {e}", "error")
+                    res_txt = f"Error executing action: {e}"
 
-                elif act == "use_ocr_backup":
-                    txt = args.get("text")
-                    matches = self.ocr.find_text(txt, "debug_grid.png")
-                    if matches:
-                        # OCR matches are in Image Pixels. We must convert to Screen Pixels.
-                        img_x, img_y = matches[0]
-                        
-                        # Convert Image -> Screen
-                        final_x = int(img_x / self.scale_x)
-                        final_y = int(img_y / self.scale_y)
-                        
-                        pyautogui.moveTo(final_x, final_y, duration=0.5)
-                        pyautogui.click()
-                        res_txt = f"OCR clicked '{txt}'"
-                    else:
-                        res_txt = "OCR found nothing."
-                    self.log(res_txt, "normal")
-
+                # --- CRITICAL: Always append result ---
+                # This ensures the conversation history stays valid (Assistant Call -> Tool Result)
+                # Even if the logic above failed, we send the "res_txt" back.
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool.id,
                     "content": res_txt
                 })
+                
+                if self.stop_flag: break
 
         self.log("🏁 Agent Stopped.", "system")
 
@@ -273,7 +286,7 @@ class AgentWorker:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vision Grid Agent (DPI Fix)")
+        self.root.title("Vision Grid Agent (Final Stable)")
         self.root.geometry("600x700")
         
         self.log_q = queue.Queue()
