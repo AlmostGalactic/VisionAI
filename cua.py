@@ -10,6 +10,8 @@ import pyautogui
 import cv2
 import numpy as np
 import easyocr
+import io
+from PIL import Image
 from openai import OpenAI
 from ultralytics import YOLOWorld
 from dotenv import load_dotenv
@@ -18,7 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.5
-MAX_RETRIES = 100
+MAX_RETRIES = 15
 
 # --- KEY MAPPING ---
 KEY_MAP = {
@@ -33,19 +35,22 @@ KEY_MAP = {
 class VisionBrain:
     def __init__(self, logger):
         self.log = logger
-        self.log("👁️ Loading YOLO Vision Model...", "system")
-        self.model = YOLOWorld('yolov8l-worldv2.pt')
+        # Switched to 's' (Small) model for CPU speed
+        self.log("👁️ Loading YOLO Vision Model (CPU Mode)...", "system")
+        self.model = YOLOWorld('yolov8s-worldv2.pt') 
 
     def find_all_items(self, description, screenshot_path):
         self.log(f"🔎 YOLO scanning for: '{description}'...", "normal")
         self.model.set_classes([description])
         
+        # device='cpu' ensures it works on all computers
         results = self.model.predict(
             screenshot_path,
-            conf=0.15,
-            imgsz=1920,
+            conf=0.10,
+            imgsz=1280, # Reduced size for CPU speed
             verbose=False,
-            max_det=10
+            max_det=10,
+            device='cpu'
         )
         
         matches = []
@@ -62,8 +67,9 @@ class VisionBrain:
 class TextBrain:
     def __init__(self, logger):
         self.log = logger
-        self.log("📖 Loading EasyOCR Model...", "system")
-        self.reader = easyocr.Reader(['en'], gpu=True)
+        self.log("📖 Loading EasyOCR Model (CPU Mode)...", "system")
+        # gpu=False ensures no errors if user lacks NVIDIA card
+        self.reader = easyocr.Reader(['en'], gpu=False) 
 
     def find_all_text(self, text_query, screenshot_path):
         self.log(f"🔎 OCR searching for: '{text_query}'...", "normal")
@@ -115,8 +121,7 @@ class AgentWorker:
             
             PROTOCOL:
             1. **AMBIGUITY:** If multiple matches found, use `match_index`.
-            2. **THINK FIRST:** Populate 'thought' field.
-            3. **COORDINATES:** Always prefer 0.0-1.0 range for x_pct/y_pct.
+            2. **COORDINATES:** Always prefer 0.0-1.0 range for x_pct/y_pct.
             
             TOOLS:
             - find_coordinates(description, type='icon'/'text', match_index=0)
@@ -131,31 +136,29 @@ class AgentWorker:
         }
 
     def take_screenshot(self):
+        # We save high-res for LOCAL vision/ocr
         path = "screen_temp.png"
         screenshot = pyautogui.screenshot()
         screenshot.save(path)
-        return path
+        return path, screenshot
 
-    def encode_image(self, image_path):
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+    def get_compressed_base64(self, pil_image):
+        # 1. Resize to max 1024 width for speed
+        max_size = (1024, 1024)
+        pil_image.thumbnail(max_size, Image.Resampling.LANCZOS)
+        
+        # 2. Save as JPEG (Fast upload)
+        buffered = io.BytesIO()
+        pil_image.convert("RGB").save(buffered, format="JPEG", quality=70)
+        
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    # --- UPDATED COORDINATE RESOLVER ---
     def resolve_coords(self, x_in, y_in):
         if x_in is None or y_in is None: return 0, 0
-        
         def convert(val, max_dim):
-            # Case 1: Standard Ratio (0.0 to 1.0) -> e.g. 0.5 = 50%
-            if val <= 1.0:
-                return int(max_dim * val)
-            # Case 2: Percentage / Ambiguous (1.0 to 100.0) -> e.g. 50 = 50%
-            # We assume values < 100 are percentages because clicking the top-left 100px is rare
-            elif val <= 100.0:
-                return int(max_dim * (val / 100.0))
-            # Case 3: Absolute Pixels (> 100.0)
-            else:
-                return int(val)
-
+            if val <= 1.0: return int(max_dim * val)
+            elif val <= 100.0: return int(max_dim * (val / 100.0))
+            else: return int(val)
         final_x = convert(x_in, self.screen_w)
         final_y = convert(y_in, self.screen_h)
         return final_x, final_y
@@ -176,12 +179,14 @@ class AgentWorker:
                 self.log("⚠️ Max retries reached. Stopping.", "error")
                 break
             
-            img_path = self.take_screenshot()
-            base64_img = self.encode_image(img_path)
+            img_path, pil_img = self.take_screenshot()
+            
+            # Compress for OpenAI
+            base64_img = self.get_compressed_base64(pil_img)
             
             content_msg = [
                 {"type": "text", "text": f"Step {loop_count}: Screen state below. OUTPUT A TOOL CALL."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_img}"}}
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
             ]
             messages.append({"role": "user", "content": content_msg})
 
@@ -241,8 +246,7 @@ class AgentWorker:
                     self.log(f"💭 {thought}", "thought")
                     self.log(f"⚡ ACTION: {action.upper()}", "action")
                     
-                    time.sleep(0.5)
-                    current_img_path = self.take_screenshot()
+                    time.sleep(0.1) 
                     result_message = "Action executed."
 
                     if action == "task_finished":
@@ -261,8 +265,8 @@ class AgentWorker:
                         idx = args.get("match_index", 0)
                         
                         matches = []
-                        if stype == "text": matches = self.ocr.find_all_text(desc, current_img_path)
-                        else: matches = self.vision.find_all_items(desc, current_img_path)
+                        if stype == "text": matches = self.ocr.find_all_text(desc, img_path)
+                        else: matches = self.vision.find_all_items(desc, img_path)
                         
                         if len(matches) > 0:
                             if idx < len(matches):
@@ -277,7 +281,7 @@ class AgentWorker:
                         self.log(result_message, "normal")
 
                     elif action == "read_screen_text":
-                        all_txt = self.ocr.read_all_text(current_img_path)
+                        all_txt = self.ocr.read_all_text(img_path)
                         preview = str(all_txt[:50])
                         result_message = f"VISIBLE: {preview}"
                         self.log(f"📄 Read Screen: {len(all_txt)} items found.", "normal")
@@ -292,13 +296,13 @@ class AgentWorker:
                          sx, sy = self.resolve_coords(args.get("start_x_pct"), args.get("start_y_pct"))
                          ex, ey = self.resolve_coords(args.get("end_x_pct"), args.get("end_y_pct"))
                          pyautogui.moveTo(sx, sy)
-                         pyautogui.dragTo(ex, ey, duration=1.0)
+                         pyautogui.dragTo(ex, ey, duration=0.8)
                          result_message = f"Dragged {sx},{sy} -> {ex},{ey}"
                          self.log(result_message, "normal")
 
                     elif action == "type_text":
                         text = args.get("text_content")
-                        pyautogui.write(text, interval=0.05)
+                        pyautogui.write(text, interval=0.02)
                         result_message = "Typed text."
                         self.log(f"⌨️ Typed: {text}", "normal")
 
@@ -324,13 +328,13 @@ class AgentWorker:
 class AgentApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vision Agent AI")
+        self.root.title("Vision Agent AI (Standard)")
         self.root.geometry("600x700")
         
         self.log_queue = queue.Queue()
         self._setup_ui()
         
-        self.log("⏳ Initializing AI Models... Please wait...", "system")
+        self.log("⏳ Initializing CPU Models... Please wait...", "system")
         threading.Thread(target=self._init_brains, daemon=True).start()
         
         self.root.after(100, self._process_log_queue)
