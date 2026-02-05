@@ -1,8 +1,7 @@
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, ttk
 import threading
 import queue
-import os
 import time
 import base64
 import json
@@ -11,16 +10,27 @@ import cv2
 import numpy as np
 import easyocr
 import io
-from PIL import Image
+import platform
+import ctypes
+from PIL import Image, ImageDraw
 from openai import OpenAI
-from ultralytics import YOLOWorld
 from dotenv import load_dotenv
+
+# --- 1. DPI SCALING FIX (CRITICAL FOR WINDOWS) ---
+# This forces Python to recognize your monitor's real 4K/2K resolution
+try:
+    if platform.system() == "Windows":
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except:
+        pass # Not on Windows or failed, continue safely
 
 # --- CONFIGURATION ---
 load_dotenv()
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.5
-MAX_RETRIES = 15
 
 # --- KEY MAPPING ---
 KEY_MAP = {
@@ -28,199 +38,145 @@ KEY_MAP = {
     "command": "command", "cmd": "command",
     "option": "option", "opt": "option",
     "windows": "win", "super": "win",
-    "return": "enter", "esc": "escape"
+    "return": "enter", "esc": "escape",
+    "space": "space"
 }
 
-# --- BRAINS (Vision & OCR) ---
-class VisionBrain:
-    def __init__(self, logger):
-        self.log = logger
-        # Switched to 's' (Small) model for CPU speed
-        self.log("👁️ Loading YOLO Vision Model (CPU Mode)...", "system")
-        self.model = YOLOWorld('yolov8s-worldv2.pt') 
-
-    def find_all_items(self, description, screenshot_path):
-        self.log(f"🔎 YOLO scanning for: '{description}'...", "normal")
-        self.model.set_classes([description])
-        
-        # device='cpu' ensures it works on all computers
-        results = self.model.predict(
-            screenshot_path,
-            conf=0.10,
-            imgsz=1280, # Reduced size for CPU speed
-            verbose=False,
-            max_det=10,
-            device='cpu'
-        )
-        
-        matches = []
-        if len(results[0].boxes) > 0:
-            for box in results[0].boxes:
-                coords = box.xyxy[0].tolist()
-                center_x = int((coords[0] + coords[2]) / 2)
-                center_y = int((coords[1] + coords[3]) / 2)
-                matches.append((center_x, center_y))
-        
-        self.log(f"🎯 YOLO found {len(matches)} matches.", "success" if matches else "error")
-        return matches
-
+# --- OPTIONAL OCR (Backup Only) ---
 class TextBrain:
     def __init__(self, logger):
         self.log = logger
-        self.log("📖 Loading EasyOCR Model (CPU Mode)...", "system")
-        # gpu=False ensures no errors if user lacks NVIDIA card
-        self.reader = easyocr.Reader(['en'], gpu=False) 
+        self.log("📖 Loading OCR Model...", "system")
+        self.reader = easyocr.Reader(['en'], gpu=False)
 
-    def find_all_text(self, text_query, screenshot_path):
-        self.log(f"🔎 OCR searching for: '{text_query}'...", "normal")
+    def find_text(self, text_query, screenshot_path):
         img = cv2.imread(screenshot_path)
         if img is None: return []
-        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        
-        results = self.reader.readtext(gray_img)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        results = self.reader.readtext(gray)
         matches = []
         for (bbox, text, conf) in results:
             if text_query.lower() in text.lower():
                 (tl, tr, br, bl) = bbox
-                center_x = int((tl[0] + br[0]) / 2)
-                center_y = int((tl[1] + br[1]) / 2)
-                matches.append((center_x, center_y))
-        
-        self.log(f"🎯 OCR found {len(matches)} matches.", "success" if matches else "error")
+                cx = int((tl[0] + br[0]) / 2)
+                cy = int((tl[1] + br[1]) / 2)
+                matches.append((cx, cy))
         return matches
-
-    def read_all_text(self, screenshot_path):
-        self.log("📖 Reading ALL text on screen...", "normal")
-        img = cv2.imread(screenshot_path)
-        if img is None: return []
-        gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        results = self.reader.readtext(gray_img)
-        return [text for (_, text, _) in results]
 
 # --- THE AGENT WORKER ---
 class AgentWorker:
-    def __init__(self, logger_func, vision_brain, text_brain):
+    def __init__(self, logger_func, text_brain):
         self.log = logger_func 
         self.client = OpenAI()
-        self.vision = vision_brain
         self.ocr = text_brain
         self.stop_flag = False
         
-        # Screen Calc
+        # Get Screen Size (Now DPI Aware)
         self.screen_w, self.screen_h = pyautogui.size()
-        test_shot = pyautogui.screenshot()
-        self.img_w, self.img_h = test_shot.size
-        self.scale_x = self.img_w / self.screen_w
-        self.scale_y = self.img_h / self.screen_h
-        
-        self.log(f"📏 Screen: {self.screen_w}x{self.screen_h} (Scale: {self.scale_x:.2f})", "system")
+        self.log(f"🖥️ Monitor Resolution: {self.screen_w}x{self.screen_h}", "system")
 
         self.system_prompt = {
             "role": "system",
-            "content": """You are a ROBOTIC ACTION AGENT.
+            "content": """You are a VISION-BASED MOUSE AGENT.
             
-            PROTOCOL:
-            1. **AMBIGUITY:** If multiple matches found, use `match_index`.
-            2. **COORDINATES:** Always prefer 0.0-1.0 range for x_pct/y_pct.
+            **INSTRUCTIONS:**
+            1. You will see a SCREENSHOT with a RED GRID (0.0 - 1.0).
+            2. To click, visually estimate the coordinate (x,y) of the target.
+            3. **CRITICAL:** You MUST call `task_finished` when the goal is met.
             
-            TOOLS:
-            - find_coordinates(description, type='icon'/'text', match_index=0)
-            - click_mouse(x_pct, y_pct, num_clicks=1, button='left')
-            - drag_mouse(start_x_pct, start_y_pct, end_x_pct, end_y_pct)
-            - scroll_screen(amount) (-500 = DOWN)
-            - read_screen_text()
-            - type_text(text_content)
-            - press_key(key_name)
-            - task_finished(success=True, reason="...")
+            **TOOLS:**
+            - `click_coordinate(x_pct, y_pct, description)`: MAIN TOOL.
+            - `type_text(text)`: Type on keyboard.
+            - `press_key(key)`: Press keys like 'enter', 'esc', 'ctrl+c'.
+            - `scroll(amount)`: Scroll down (-500) or up (500).
+            - `use_ocr_backup(text)`: Use ONLY if visual grid fails.
+            - `task_finished(reason)`: Call this IMMEDIATELY when done.
             """
         }
 
-    def take_screenshot(self):
-        # We save high-res for LOCAL vision/ocr
-        path = "screen_temp.png"
+    def take_screenshot_with_grid(self):
         screenshot = pyautogui.screenshot()
-        screenshot.save(path)
-        return path, screenshot
+        img_w, img_h = screenshot.size
+        
+        # --- SCALING CHECK ---
+        # If screenshot is bigger than screen size (Retina/HighDPI), we must know the ratio.
+        self.scale_x = img_w / self.screen_w
+        self.scale_y = img_h / self.screen_h
+        
+        draw = ImageDraw.Draw(screenshot)
+        
+        # Grid settings
+        step_x = img_w / 10
+        step_y = img_h / 10
+        
+        # Draw Red Grid
+        for i in range(1, 10):
+            x = i * step_x
+            draw.line([(x, 0), (x, img_h)], fill="red", width=2)
+            draw.text((x + 5, 10), f"{i/10:.1f}", fill="red", font_size=20)
 
-    def get_compressed_base64(self, pil_image):
-        # 1. Resize to max 1024 width for speed
-        max_size = (1024, 1024)
-        pil_image.thumbnail(max_size, Image.Resampling.LANCZOS)
-        
-        # 2. Save as JPEG (Fast upload)
+        for i in range(1, 10):
+            y = i * step_y
+            draw.line([(0, y), (img_w, y)], fill="red", width=2)
+            draw.text((10, y + 5), f"{i/10:.1f}", fill="red", font_size=20)
+
+        screenshot.save("debug_grid.png")
+        return screenshot
+
+    def get_base64_image(self, pil_image):
+        pil_image.thumbnail((1024, 1024))
         buffered = io.BytesIO()
-        pil_image.convert("RGB").save(buffered, format="JPEG", quality=70)
-        
+        pil_image.save(buffered, format="JPEG", quality=70)
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    def resolve_coords(self, x_in, y_in):
-        if x_in is None or y_in is None: return 0, 0
-        def convert(val, max_dim):
-            if val <= 1.0: return int(max_dim * val)
-            elif val <= 100.0: return int(max_dim * (val / 100.0))
-            else: return int(val)
-        final_x = convert(x_in, self.screen_w)
-        final_y = convert(y_in, self.screen_h)
-        return final_x, final_y
-
-    def run_task(self, user_task):
+    def run_task(self, user_task, max_steps):
         self.stop_flag = False
         messages = [self.system_prompt]
-        messages.append({"role": "user", "content": user_task})
+        messages.append({"role": "user", "content": f"Task: {user_task}"})
         
-        loop_count = 0
-        task_active = True
-        
+        step = 0
         self.log(f"🚀 Starting Task: {user_task}", "system")
 
-        while task_active and not self.stop_flag:
-            loop_count += 1
-            if loop_count > MAX_RETRIES:
-                self.log("⚠️ Max retries reached. Stopping.", "error")
+        while not self.stop_flag:
+            step += 1
+            if step > max_steps:
+                self.log(f"⚠️ Max steps ({max_steps}) reached. Stopping.", "error")
                 break
-            
-            img_path, pil_img = self.take_screenshot()
-            
-            # Compress for OpenAI
-            base64_img = self.get_compressed_base64(pil_img)
-            
-            content_msg = [
-                {"type": "text", "text": f"Step {loop_count}: Screen state below. OUTPUT A TOOL CALL."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-            ]
-            messages.append({"role": "user", "content": content_msg})
 
-            self.log(f"🧠 Thinking (Step {loop_count})...", "normal")
-            
+            grid_img = self.take_screenshot_with_grid()
+            b64_img = self.get_base64_image(grid_img)
+
+            user_msg = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Step {step}/{max_steps}. Screen state below."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                ]
+            }
+            messages.append(user_msg)
+            self.log(f"🧠 Thinking (Step {step})...", "normal")
+
             try:
                 response = self.client.chat.completions.create(
                     model="gpt-4o",
                     messages=messages,
-                    tool_choice="required",
+                    max_tokens=300,
                     tools=[{
                         "type": "function",
                         "function": {
                             "name": "computer_tools",
-                            "description": "Control tools",
+                            "description": "Control computer",
                             "parameters": {
                                 "type": "object",
                                 "properties": {
                                     "thought": {"type": "string"},
-                                    "action": {"type": "string", "enum": ["click_mouse", "drag_mouse", "find_coordinates", "read_screen_text", "type_text", "press_key", "scroll_screen", "task_finished"]},
-                                    "description": {"type": "string"},
-                                    "type": {"type": "string", "enum": ["icon", "text"]},
-                                    "match_index": {"type": "integer"},
-                                    "text_content": {"type": "string"},
-                                    "num_clicks": {"type": "integer"},
-                                    "amount": {"type": "integer"},
-                                    "button": {"type": "string"},
+                                    "action": {"type": "string", "enum": ["click_coordinate", "type_text", "press_key", "scroll", "use_ocr_backup", "task_finished"]},
                                     "x_pct": {"type": "number"},
                                     "y_pct": {"type": "number"},
-                                    "start_x_pct": {"type": "number"},
-                                    "start_y_pct": {"type": "number"},
-                                    "end_x_pct": {"type": "number"},
-                                    "end_y_pct": {"type": "number"},
-                                    "key_name": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "text": {"type": "string"},
+                                    "key": {"type": "string"},
+                                    "amount": {"type": "integer"},
                                     "reason": {"type": "string"}
                                 },
                                 "required": ["thought", "action"]
@@ -229,201 +185,185 @@ class AgentWorker:
                     }]
                 )
             except Exception as e:
-                self.log(f"❌ API Error: {e}", "error")
+                self.log(f"API Error: {e}", "error")
                 break
 
             msg = response.choices[0].message
             messages.append(msg)
-            
-            if msg.tool_calls:
-                for tool in msg.tool_calls:
-                    if self.stop_flag: break
-                    
-                    args = json.loads(tool.function.arguments)
-                    action = args.get("action")
-                    thought = args.get("thought", "No thought provided.")
-                    
-                    self.log(f"💭 {thought}", "thought")
-                    self.log(f"⚡ ACTION: {action.upper()}", "action")
-                    
-                    time.sleep(0.1) 
-                    result_message = "Action executed."
 
-                    if action == "task_finished":
-                        self.log(f"✅ Success: {args.get('reason')}", "success")
-                        task_active = False
-                    
-                    elif action == "scroll_screen":
-                        amt = args.get("amount", -500)
-                        pyautogui.scroll(amt)
-                        result_message = f"Scrolled {amt}"
-                        self.log(result_message, "normal")
+            if not msg.tool_calls:
+                content = msg.content if msg.content else "No content."
+                self.log(f"💬 AI Message: {content}", "normal")
+                messages.append({"role": "user", "content": "You did not trigger an action. If you are done, use the 'task_finished' tool."})
+                continue 
 
-                    elif action == "find_coordinates":
-                        desc = args.get("description")
-                        stype = args.get("type")
-                        idx = args.get("match_index", 0)
+            for tool in msg.tool_calls:
+                if self.stop_flag: break
+                
+                args = json.loads(tool.function.arguments)
+                act = args.get("action")
+                thought = args.get("thought", "")
+                
+                self.log(f"💭 {thought}", "thought")
+                self.log(f"⚡ {act.upper()}", "action")
+
+                res_txt = "Action Done."
+
+                if act == "task_finished":
+                    self.log(f"✅ Finished: {args.get('reason')}", "success")
+                    self.stop_flag = True
+                    break
+
+                elif act == "click_coordinate":
+                    xp, yp = args.get("x_pct"), args.get("y_pct")
+                    if xp is not None:
+                        # --- SCALING FIX ---
+                        # We multiply percentage by SCREEN size, not Image size.
+                        real_x = int(xp * self.screen_w)
+                        real_y = int(yp * self.screen_h)
                         
-                        matches = []
-                        if stype == "text": matches = self.ocr.find_all_text(desc, img_path)
-                        else: matches = self.vision.find_all_items(desc, img_path)
+                        # VISUAL DEBUG: Move mouse slowly so you can see where it aims
+                        self.log(f"🖱️ Aiming at {real_x},{real_y}...", "normal")
+                        pyautogui.moveTo(real_x, real_y, duration=0.5) 
+                        pyautogui.click()
+                        self.log(f"🖱️ CLICKED!", "success")
+                    else:
+                        res_txt = "Error: Coordinates missing."
+
+                elif act == "type_text":
+                    pyautogui.write(args.get("text"), interval=0.05)
+                    self.log(f"⌨️ Type: {args.get('text')}", "normal")
+
+                elif act == "press_key":
+                    k = args.get("key", "").lower()
+                    if k in KEY_MAP: k = KEY_MAP[k]
+                    pyautogui.press(k)
+                    self.log(f"🎹 Press: {k}", "normal")
+
+                elif act == "scroll":
+                    pyautogui.scroll(args.get("amount", -500))
+
+                elif act == "use_ocr_backup":
+                    txt = args.get("text")
+                    matches = self.ocr.find_text(txt, "debug_grid.png")
+                    if matches:
+                        # OCR matches are in Image Pixels. We must convert to Screen Pixels.
+                        img_x, img_y = matches[0]
                         
-                        if len(matches) > 0:
-                            if idx < len(matches):
-                                found_x, found_y = matches[idx]
-                                x_pct = (found_x / self.scale_x) / self.screen_w
-                                y_pct = (found_y / self.scale_y) / self.screen_h
-                                result_message = f"FOUND {len(matches)} matches. Using #{idx}. Coords: x={x_pct:.4f}, y={y_pct:.4f}."
-                            else:
-                                result_message = f"ERROR: match_index {idx} out of range ({len(matches)} found)."
-                        else:
-                            result_message = f"FAILED to find '{desc}'."
-                        self.log(result_message, "normal")
+                        # Convert Image -> Screen
+                        final_x = int(img_x / self.scale_x)
+                        final_y = int(img_y / self.scale_y)
+                        
+                        pyautogui.moveTo(final_x, final_y, duration=0.5)
+                        pyautogui.click()
+                        res_txt = f"OCR clicked '{txt}'"
+                    else:
+                        res_txt = "OCR found nothing."
+                    self.log(res_txt, "normal")
 
-                    elif action == "read_screen_text":
-                        all_txt = self.ocr.read_all_text(img_path)
-                        preview = str(all_txt[:50])
-                        result_message = f"VISIBLE: {preview}"
-                        self.log(f"📄 Read Screen: {len(all_txt)} items found.", "normal")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool.id,
+                    "content": res_txt
+                })
 
-                    elif action == "click_mouse":
-                        tx, ty = self.resolve_coords(args.get("x_pct"), args.get("y_pct"))
-                        pyautogui.click(x=tx, y=ty, clicks=args.get("num_clicks", 1), button=args.get("button", "left"))
-                        result_message = f"Clicked {tx},{ty}"
-                        self.log(result_message, "normal")
+        self.log("🏁 Agent Stopped.", "system")
 
-                    elif action == "drag_mouse":
-                         sx, sy = self.resolve_coords(args.get("start_x_pct"), args.get("start_y_pct"))
-                         ex, ey = self.resolve_coords(args.get("end_x_pct"), args.get("end_y_pct"))
-                         pyautogui.moveTo(sx, sy)
-                         pyautogui.dragTo(ex, ey, duration=0.8)
-                         result_message = f"Dragged {sx},{sy} -> {ex},{ey}"
-                         self.log(result_message, "normal")
-
-                    elif action == "type_text":
-                        text = args.get("text_content")
-                        pyautogui.write(text, interval=0.02)
-                        result_message = "Typed text."
-                        self.log(f"⌨️ Typed: {text}", "normal")
-
-                    elif action == "press_key":
-                        raw_keys = args.get("key_name", "").lower().replace(" ", "").split('+')
-                        clean_keys = [KEY_MAP.get(k, k) for k in raw_keys]
-                        if len(clean_keys) > 1: pyautogui.hotkey(*clean_keys, interval=0.1)
-                        else: pyautogui.press(clean_keys[0])
-                        result_message = f"Pressed {clean_keys}"
-                        self.log(result_message, "normal")
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool.id,
-                        "content": result_message
-                    })
-
-                    if not task_active: break
-        
-        self.log("🏁 Task ended.", "system")
-
-# --- MAIN GUI CLASS ---
-class AgentApp:
+# --- MAIN GUI ---
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vision Agent AI (Standard)")
+        self.root.title("Vision Grid Agent (DPI Fix)")
         self.root.geometry("600x700")
         
-        self.log_queue = queue.Queue()
-        self._setup_ui()
+        self.log_q = queue.Queue()
         
-        self.log("⏳ Initializing CPU Models... Please wait...", "system")
-        threading.Thread(target=self._init_brains, daemon=True).start()
+        lbl_font = ("Arial", 12, "bold")
+        btn_font = ("Arial", 12, "bold")
         
-        self.root.after(100, self._process_log_queue)
-
-    def _setup_ui(self):
-        top_frame = tk.Frame(self.root, pady=10, padx=10)
+        top_frame = tk.Frame(root, padx=10, pady=10)
         top_frame.pack(fill=tk.X)
         
-        tk.Label(top_frame, text="Task:").pack(side=tk.LEFT)
-        self.task_entry = tk.Entry(top_frame, width=40)
-        self.task_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
-        self.task_entry.bind('<Return>', lambda event: self.start_agent())
+        tk.Label(top_frame, text="Task Instruction:", font=lbl_font).pack(anchor="w")
+        self.entry = tk.Entry(top_frame, font=("Arial", 11), width=50)
+        self.entry.pack(fill=tk.X, pady=(0, 10))
         
-        btn_frame = tk.Frame(self.root, pady=5)
-        btn_frame.pack(fill=tk.X, padx=10)
-        
-        self.start_btn = tk.Button(btn_frame, text="▶ START AGENT", bg="#ccffcc", command=self.start_agent, state=tk.DISABLED)
-        self.start_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        
-        self.stop_btn = tk.Button(btn_frame, text="⏹ STOP", bg="#ffcccc", command=self.stop_agent, state=tk.DISABLED)
-        self.stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        step_frame = tk.Frame(top_frame)
+        step_frame.pack(fill=tk.X, anchor="w")
+        tk.Label(step_frame, text="Max Steps:", font=("Arial", 10)).pack(side=tk.LEFT)
+        self.steps_spin = tk.Spinbox(step_frame, from_=5, to=100, width=5, font=("Arial", 10))
+        self.steps_spin.delete(0, "end")
+        self.steps_spin.insert(0, 15)
+        self.steps_spin.pack(side=tk.LEFT, padx=5)
 
-        self.console = scrolledtext.ScrolledText(self.root, state='disabled', bg="black", fg="white", font=("Consolas", 10))
+        btn_frame = tk.Frame(root, padx=10, pady=5)
+        btn_frame.pack(fill=tk.X)
+        
+        self.btn_start = tk.Button(btn_frame, text="▶ START AGENT", font=btn_font, bg="#ccffcc", height=2, command=self.start)
+        self.btn_start.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+        
+        self.btn_stop = tk.Button(btn_frame, text="⏹ STOP", font=btn_font, bg="#ffcccc", height=2, command=self.stop, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
+
+        self.console = scrolledtext.ScrolledText(root, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 11), padx=10, pady=10)
         self.console.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        self.console.tag_config("system", foreground="white")
-        self.console.tag_config("thought", foreground="cyan")
-        self.console.tag_config("action", foreground="yellow")
-        self.console.tag_config("success", foreground="#00ff00") 
-        self.console.tag_config("error", foreground="#ff3333")   
-        self.console.tag_config("normal", foreground="#cccccc") 
+        self.console.tag_config("thought", foreground="#569cd6")
+        self.console.tag_config("action", foreground="#ce9178")
+        self.console.tag_config("error", foreground="#f44747")
+        self.console.tag_config("success", foreground="#b5cea8")
+        self.console.tag_config("system", foreground="#808080")
 
-    def _init_brains(self):
-        try:
-            def logger(text, tag="normal"): self.log_queue.put((text, tag))
-            self.vision = VisionBrain(logger)
-            self.text = TextBrain(logger)
-            self.agent_worker = None
-            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
-            self.log("✅ Ready. Type a task and click Start.", "success")
-        except Exception as e:
-            self.log(f"CRITICAL ERROR LOADING MODELS: {e}", "error")
+        threading.Thread(target=self.init_ocr, daemon=True).start()
+        self.root.after(100, self.process_logs)
 
-    def log(self, text, tag="normal"):
-        self.log_queue.put((text, tag))
+    def init_ocr(self):
+        def log_bridge(t, s="normal"): self.log_q.put((t, s))
+        self.ocr = TextBrain(log_bridge)
+        self.log_q.put(("✅ System Ready.", "success"))
 
-    def _process_log_queue(self):
-        while not self.log_queue.empty():
-            text, tag = self.log_queue.get()
+    def log(self, text, style="normal"):
+        self.log_q.put((text, style))
+
+    def process_logs(self):
+        while not self.log_q.empty():
+            t, s = self.log_q.get()
             self.console.config(state='normal')
-            self.console.insert(tk.END, text + "\n", tag)
-            self.console.see(tk.END) 
+            self.console.insert(tk.END, f"{t}\n", s)
+            self.console.see(tk.END)
             self.console.config(state='disabled')
-        self.root.after(100, self._process_log_queue)
+        self.root.after(100, self.process_logs)
 
-    def start_agent(self):
-        task = self.task_entry.get()
-        if not task:
-            messagebox.showwarning("Input Error", "Please enter a task.")
-            return
+    def start(self):
+        task = self.entry.get()
+        if not task: return messagebox.showwarning("Error", "Enter a task!")
+        try: steps = int(self.steps_spin.get())
+        except: steps = 15
+        self.worker = AgentWorker(self.log, self.ocr)
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        self.entry.config(state=tk.DISABLED)
+        threading.Thread(target=self.run_worker_thread, args=(task, steps), daemon=True).start()
 
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.task_entry.config(state=tk.DISABLED)
-        
-        def thread_logger(text, tag="normal"): self.log_queue.put((text, tag))
-        self.agent_worker = AgentWorker(thread_logger, self.vision, self.text)
-        self.thread = threading.Thread(target=self._run_thread_logic, args=(task,))
-        self.thread.start()
-
-    def _run_thread_logic(self, task):
+    def run_worker_thread(self, task, steps):
         try:
-            self.agent_worker.run_task(task)
+            self.worker.run_task(task, steps)
         except Exception as e:
-            self.log(f"Thread Error: {e}", "error")
+            self.log(f"Critical Error: {e}", "error")
         finally:
-            self.root.after(0, self._reset_ui)
+            self.root.after(0, self.reset_ui)
 
-    def stop_agent(self):
-        if self.agent_worker:
-            self.log("🛑 Stopping agent...", "error")
-            self.agent_worker.stop_flag = True
+    def stop(self):
+        if hasattr(self, 'worker'):
+            self.log("🛑 Stopping...", "error")
+            self.worker.stop_flag = True
 
-    def _reset_ui(self):
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.task_entry.config(state=tk.NORMAL)
+    def reset_ui(self):
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.entry.config(state=tk.NORMAL)
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = AgentApp(root)
+    App(root)
     root.mainloop()
