@@ -1,0 +1,8 @@
+openai
+ultralytics
+easyocr
+opencv-python
+numpy
+pyautogui
+python-dotenv
+Pillow
