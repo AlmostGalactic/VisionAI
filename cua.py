@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, Toplevel, Label
 import threading
 import queue
 import time
@@ -12,7 +12,7 @@ import easyocr
 import io
 import platform
 import ctypes
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageTk, ImageFont
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -38,10 +38,10 @@ KEY_MAP = {
     "option": "option", "opt": "option",
     "windows": "win", "super": "win",
     "return": "enter", "esc": "escape",
-    "space": "space"
+    "space": "space", "delete": "delete"
 }
 
-# --- OPTIONAL OCR (Backup Only) ---
+# --- OCR ENGINE (TextBrain) ---
 class TextBrain:
     def __init__(self, logger):
         self.log = logger
@@ -49,6 +49,9 @@ class TextBrain:
         self.reader = easyocr.Reader(['en'], gpu=False)
 
     def find_text(self, text_query, screenshot_path):
+        """
+        Reads text from the CLEAN screenshot (no grid lines).
+        """
         img = cv2.imread(screenshot_path)
         if img is None: return []
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -64,8 +67,9 @@ class TextBrain:
 
 # --- THE AGENT WORKER ---
 class AgentWorker:
-    def __init__(self, logger_func, text_brain):
-        self.log = logger_func 
+    def __init__(self, logger_func, debug_updater, text_brain):
+        self.log = logger_func
+        self.update_debug_view = debug_updater
         self.client = OpenAI()
         self.ocr = text_brain
         self.stop_flag = False
@@ -79,46 +83,88 @@ class AgentWorker:
             "content": """You are a VISION-BASED MOUSE AGENT.
             
             **INSTRUCTIONS:**
-            1. You will see a SCREENSHOT with a RED GRID (0.0 - 1.0).
-            2. To click, visually estimate the coordinate (x,y) of the target.
-            3. **CRITICAL:** You MUST call `task_finished` when the goal is met.
+            1. You will see a SCREENSHOT with a FINE RED GRID (30x30).
+            2. The grid steps are approx 0.033.
+            3. A BLUE CIRCLE represents your CURRENT MOUSE POSITION.
+            4. To click, visually estimate the coordinate (x,y) of the target.
+            5. **CRITICAL:** You MUST call `task_finished` when the goal is met.
             
             **TOOLS:**
             - `click_coordinate(x_pct, y_pct, description)`: MAIN TOOL.
+            - `drag_mouse(start_x, start_y, end_x, end_y)`: Drag from A to B.
             - `type_text(text)`: Type on keyboard.
-            - `press_key(key)`: Press keys like 'enter', 'esc', 'ctrl+c'.
+            - `press_key(key)`: Press keys. Supports combos like "ctrl+z".
             - `scroll(amount)`: Scroll down (-500) or up (500).
-            - `use_ocr_backup(text)`: Use ONLY if visual grid fails.
+            - `use_ocr_backup(text)`: Use ONLY if visual grid fails. It reads a CLEAN image without grid lines.
             - `task_finished(reason)`: Call this IMMEDIATELY when done.
             """
         }
 
-    def take_screenshot_with_grid(self):
-        screenshot = pyautogui.screenshot()
-        img_w, img_h = screenshot.size
+    def capture_screen_data(self):
+        """
+        Captures the screen ONCE, then creates two versions:
+        1. Clean version (for OCR)
+        2. Grid version + Mouse Cursor (for AI Vision)
+        """
+        clean_screenshot = pyautogui.screenshot()
+        img_w, img_h = clean_screenshot.size
         
         self.scale_x = img_w / self.screen_w
         self.scale_y = img_h / self.screen_h
         
-        draw = ImageDraw.Draw(screenshot)
+        # 1. Save CLEAN version for OCR
+        clean_screenshot.save("debug_clean.png")
+
+        # 2. Create GRID version for AI
+        grid_img = clean_screenshot.copy()
+        draw = ImageDraw.Draw(grid_img)
         
-        # Grid settings
-        step_x = img_w / 10
-        step_y = img_h / 10
+        # --- ULTRA PRECISION GRID (30x30) ---
+        divisions = 30
+        step_x = img_w / divisions
+        step_y = img_h / divisions
         
-        # Draw Red Grid
-        for i in range(1, 10):
+        # Vertical Lines
+        for i in range(1, divisions):
             x = i * step_x
-            draw.line([(x, 0), (x, img_h)], fill="red", width=2)
-            draw.text((x + 5, 10), f"{i/10:.1f}", fill="red", font_size=20)
+            draw.line([(x, 0), (x, img_h)], fill=(255, 0, 0, 100), width=1)
+            if i % 3 == 0: 
+                draw.text((x + 2, 5), f"{i/divisions:.2f}", fill="red", font_size=15)
 
-        for i in range(1, 10):
+        # Horizontal Lines
+        for i in range(1, divisions):
             y = i * step_y
-            draw.line([(0, y), (img_w, y)], fill="red", width=2)
-            draw.text((10, y + 5), f"{i/10:.1f}", fill="red", font_size=20)
+            draw.line([(0, y), (img_w, y)], fill=(255, 0, 0, 100), width=1)
+            if i % 3 == 0:
+                draw.text((5, y + 2), f"{i/divisions:.2f}", fill="red", font_size=15)
 
-        screenshot.save("debug_grid.png")
-        return screenshot
+        # --- DRAW CURRENT MOUSE POSITION ---
+        try:
+            # Get current mouse position
+            curr_x, curr_y = pyautogui.position()
+            
+            # Scale it to image coordinates (if DPI scaling exists)
+            img_mx = curr_x * self.scale_x
+            img_my = curr_y * self.scale_y
+            
+            r = 15 # Radius of mouse marker
+            
+            # Draw Blue Circle
+            draw.ellipse((img_mx - r, img_my - r, img_mx + r, img_my + r), outline="blue", width=4)
+            # Draw Crosshair
+            draw.line((img_mx - r*1.5, img_my, img_mx + r*1.5, img_my), fill="blue", width=2)
+            draw.line((img_mx, img_my - r*1.5, img_mx, img_my + r*1.5), fill="blue", width=2)
+            
+            # Label
+            draw.text((img_mx + 20, img_my - 20), "MOUSE", fill="blue", font_size=20)
+            
+        except Exception as e:
+            self.log(f"Warning: Could not draw mouse cursor: {e}", "error")
+
+        # Save Grid version for visual debugging
+        grid_img.save("debug_grid.png")
+        
+        return clean_screenshot, grid_img
 
     def get_base64_image(self, pil_image):
         pil_image.thumbnail((1024, 1024))
@@ -140,13 +186,19 @@ class AgentWorker:
                 self.log(f"⚠️ Max steps ({max_steps}) reached. Stopping.", "error")
                 break
 
-            grid_img = self.take_screenshot_with_grid()
+            # --- CAPTURE PHASE ---
+            clean_img, grid_img = self.capture_screen_data()
+            
+            # Send the GRID image to the Debug UI (so user sees what AI sees)
+            self.update_debug_view(grid_img, "Thinking...", None)
+            
+            # Send the GRID image to OpenAI
             b64_img = self.get_base64_image(grid_img)
 
             user_msg = {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": f"Step {step}/{max_steps}. Screen state below."},
+                    {"type": "text", "text": f"Step {step}/{max_steps}. Red Grid = Coords. Blue Circle = Your Mouse."},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
                 ]
             }
@@ -167,9 +219,13 @@ class AgentWorker:
                                 "type": "object",
                                 "properties": {
                                     "thought": {"type": "string"},
-                                    "action": {"type": "string", "enum": ["click_coordinate", "type_text", "press_key", "scroll", "use_ocr_backup", "task_finished"]},
+                                    "action": {"type": "string", "enum": ["click_coordinate", "drag_mouse", "type_text", "press_key", "scroll", "use_ocr_backup", "task_finished"]},
                                     "x_pct": {"type": "number"},
                                     "y_pct": {"type": "number"},
+                                    "start_x": {"type": "number"},
+                                    "start_y": {"type": "number"},
+                                    "end_x": {"type": "number"},
+                                    "end_y": {"type": "number"},
                                     "description": {"type": "string"},
                                     "text": {"type": "string"},
                                     "key": {"type": "string"},
@@ -197,12 +253,8 @@ class AgentWorker:
             for tool in msg.tool_calls:
                 if self.stop_flag: break
                 
-                # --- FIX: ROBUST ERROR HANDLING ---
-                # We initialize default values so we can ALWAYS report back to OpenAI
-                # even if parsing fails. This prevents the 400 error.
                 act = "unknown"
                 res_txt = "Action failed."
-                args = {}
                 
                 try:
                     args = json.loads(tool.function.arguments)
@@ -212,7 +264,21 @@ class AgentWorker:
                     self.log(f"💭 {thought}", "thought")
                     self.log(f"⚡ {act.upper()}", "action")
 
-                    # Execute Action
+                    # --- DEBUG VIEW UPDATE ---
+                    debug_coords = None
+                    debug_label = f"ACTION: {act}"
+                    if act == "click_coordinate":
+                        xp, yp = args.get("x_pct"), args.get("y_pct")
+                        if xp: debug_coords = (xp, yp)
+                    elif act == "drag_mouse":
+                        sx, sy = args.get("start_x"), args.get("start_y")
+                        if sx: debug_coords = (sx, sy)
+
+                    if debug_coords:
+                        self.update_debug_view(grid_img, debug_label, debug_coords)
+                        time.sleep(0.5)
+
+                    # --- EXECUTE ACTIONS ---
                     if act == "task_finished":
                         self.log(f"✅ Finished: {args.get('reason')}", "success")
                         self.stop_flag = True
@@ -230,6 +296,20 @@ class AgentWorker:
                         else:
                             res_txt = "Error: Coordinates missing."
 
+                    elif act == "drag_mouse":
+                        sx, sy = args.get("start_x"), args.get("start_y")
+                        ex, ey = args.get("end_x"), args.get("end_y")
+                        if None not in [sx, sy, ex, ey]:
+                            real_sx, real_sy = int(sx * self.screen_w), int(sy * self.screen_h)
+                            real_ex, real_ey = int(ex * self.screen_w), int(ey * self.screen_h)
+                            
+                            self.log(f"✊ Dragging {real_sx},{real_sy} -> {real_ex},{real_ey}", "normal")
+                            pyautogui.moveTo(real_sx, real_sy)
+                            pyautogui.dragTo(real_ex, real_ey, duration=1.0, button='left')
+                            res_txt = "Dragged."
+                        else:
+                            res_txt = "Error: Missing drag coordinates."
+
                     elif act == "type_text":
                         text_to_type = args.get("text", "")
                         pyautogui.write(text_to_type, interval=0.05)
@@ -237,11 +317,21 @@ class AgentWorker:
                         res_txt = "Typed text."
 
                     elif act == "press_key":
-                        k = args.get("key", "").lower()
-                        if k in KEY_MAP: k = KEY_MAP[k]
-                        pyautogui.press(k)
-                        self.log(f"🎹 Press: {k}", "normal")
-                        res_txt = f"Pressed {k}."
+                        raw_key = args.get("key", "").lower()
+                        keys = raw_key.split('+')
+                        final_keys = []
+                        for k in keys:
+                            k = k.strip()
+                            if k in KEY_MAP: k = KEY_MAP[k]
+                            final_keys.append(k)
+                        
+                        if len(final_keys) > 1:
+                            pyautogui.hotkey(*final_keys)
+                            self.log(f"🎹 Combo: {'+'.join(final_keys)}", "normal")
+                        else:
+                            pyautogui.press(final_keys[0])
+                            self.log(f"🎹 Press: {final_keys[0]}", "normal")
+                        res_txt = f"Pressed {raw_key}."
 
                     elif act == "scroll":
                         pyautogui.scroll(args.get("amount", -500))
@@ -249,29 +339,35 @@ class AgentWorker:
 
                     elif act == "use_ocr_backup":
                         txt = args.get("text")
-                        matches = self.ocr.find_text(txt, "debug_grid.png")
+                        # Use clean image for OCR
+                        matches = self.ocr.find_text(txt, "debug_clean.png")
+                        
                         if matches:
                             img_x, img_y = matches[0]
                             final_x = int(img_x / self.scale_x)
                             final_y = int(img_y / self.scale_y)
+                            
+                            self.log(f"🔍 OCR found '{txt}' at {final_x},{final_y}", "success")
+                            
+                            # Visual Debug for OCR Click
+                            vis_x = img_x / (self.screen_w * self.scale_x)
+                            vis_y = img_y / (self.screen_h * self.scale_y)
+                            self.update_debug_view(grid_img, f"OCR CLICK: {txt}", (vis_x, vis_y))
+                            
                             pyautogui.moveTo(final_x, final_y, duration=0.5)
                             pyautogui.click()
                             res_txt = f"OCR clicked '{txt}'"
                         else:
+                            self.log(f"❌ OCR could not find '{txt}'", "error")
                             res_txt = "OCR found nothing."
-                        self.log(res_txt, "normal")
                 
                 except json.JSONDecodeError:
-                    # If JSON fails, we record the error but DO NOT crash the loop
                     self.log(f"⚠️ JSON Parse Error on tool call.", "error")
                     res_txt = "Error: Invalid JSON format generated by AI. Please retry."
                 except Exception as e:
                     self.log(f"⚠️ Action Error: {e}", "error")
                     res_txt = f"Error executing action: {e}"
 
-                # --- CRITICAL: Always append result ---
-                # This ensures the conversation history stays valid (Assistant Call -> Tool Result)
-                # Even if the logic above failed, we send the "res_txt" back.
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool.id,
@@ -286,10 +382,11 @@ class AgentWorker:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vision Grid Agent (Final Stable)")
-        self.root.geometry("600x700")
+        self.root.title("Vision Agent")
+        self.root.geometry("600x750")
         
         self.log_q = queue.Queue()
+        self.debug_q = queue.Queue()
         
         lbl_font = ("Arial", 12, "bold")
         btn_font = ("Arial", 12, "bold")
@@ -301,13 +398,20 @@ class App:
         self.entry = tk.Entry(top_frame, font=("Arial", 11), width=50)
         self.entry.pack(fill=tk.X, pady=(0, 10))
         
-        step_frame = tk.Frame(top_frame)
-        step_frame.pack(fill=tk.X, anchor="w")
-        tk.Label(step_frame, text="Max Steps:", font=("Arial", 10)).pack(side=tk.LEFT)
-        self.steps_spin = tk.Spinbox(step_frame, from_=5, to=100, width=5, font=("Arial", 10))
+        # --- CONTROL ROW ---
+        ctrl_frame = tk.Frame(top_frame)
+        ctrl_frame.pack(fill=tk.X, anchor="w")
+        
+        tk.Label(ctrl_frame, text="Max Steps:", font=("Arial", 10)).pack(side=tk.LEFT)
+        self.steps_spin = tk.Spinbox(ctrl_frame, from_=5, to=100, width=5, font=("Arial", 10))
         self.steps_spin.delete(0, "end")
         self.steps_spin.insert(0, 15)
         self.steps_spin.pack(side=tk.LEFT, padx=5)
+
+        # DEBUG CHECKBOX
+        self.debug_var = tk.IntVar(value=1) # Default ON
+        self.chk_debug = tk.Checkbutton(ctrl_frame, text="Show Vision Debugger", variable=self.debug_var, font=("Arial", 10))
+        self.chk_debug.pack(side=tk.LEFT, padx=20)
 
         btn_frame = tk.Frame(root, padx=10, pady=5)
         btn_frame.pack(fill=tk.X)
@@ -327,8 +431,11 @@ class App:
         self.console.tag_config("success", foreground="#b5cea8")
         self.console.tag_config("system", foreground="#808080")
 
+        self.debug_window = None
+        self.debug_label = None
+
         threading.Thread(target=self.init_ocr, daemon=True).start()
-        self.root.after(100, self.process_logs)
+        self.root.after(100, self.process_queues)
 
     def init_ocr(self):
         def log_bridge(t, s="normal"): self.log_q.put((t, s))
@@ -336,23 +443,80 @@ class App:
         self.log_q.put(("✅ System Ready.", "success"))
 
     def log(self, text, style="normal"):
-        self.log_q.put((text, style))
+        self.log_q.put(("log", text, style))
 
-    def process_logs(self):
+    # --- DEBUG VIEW UPDATER ---
+    def update_debug_image(self, pil_img, status_text, coords):
+        if self.debug_var.get() == 1:
+            self.debug_q.put((pil_img, status_text, coords))
+
+    def process_queues(self):
+        # Process Logs
         while not self.log_q.empty():
-            t, s = self.log_q.get()
-            self.console.config(state='normal')
-            self.console.insert(tk.END, f"{t}\n", s)
-            self.console.see(tk.END)
-            self.console.config(state='disabled')
-        self.root.after(100, self.process_logs)
+            item = self.log_q.get()
+            if item[0] == "log":
+                _, text, style = item
+                self.console.config(state='normal')
+                self.console.insert(tk.END, f"{text}\n", style)
+                self.console.see(tk.END)
+                self.console.config(state='disabled')
+            else:
+                self.console.config(state='normal')
+                self.console.insert(tk.END, f"{item[0]}\n", item[1])
+                self.console.see(tk.END)
+                self.console.config(state='disabled')
+
+        # Process Debug Images
+        while not self.debug_q.empty():
+            pil_img, text, coords = self.debug_q.get()
+            self.show_debug_window(pil_img, text, coords)
+
+        self.root.after(100, self.process_queues)
+
+    def show_debug_window(self, pil_img, text, coords):
+        if self.debug_window is None or not self.debug_window.winfo_exists():
+            self.debug_window = Toplevel(self.root)
+            self.debug_window.title("AI Vision Stream")
+            self.debug_window.geometry("600x400")
+            self.debug_label = Label(self.debug_window)
+            self.debug_label.pack(fill=tk.BOTH, expand=True)
+
+        img_copy = pil_img.copy()
+        draw = ImageDraw.Draw(img_copy)
+        w, h = img_copy.size
+        
+        # Draw Coordinate Target (Green)
+        if coords:
+            cx, cy = coords[0] * w, coords[1] * h
+            r = 10
+            draw.ellipse((cx-r, cy-r, cx+r, cy+r), outline="green", width=3)
+            draw.line((cx-r*2, cy, cx+r*2, cy), fill="green", width=2)
+            draw.line((cx, cy-r*2, cx, cy+r*2), fill="green", width=2)
+        
+        # Draw Status Text
+        if text:
+            draw.rectangle((0, 0, w, 40), fill="black")
+            draw.text((10, 10), text, fill="white", font_size=20)
+
+        # Resize for the window
+        win_w = self.debug_window.winfo_width()
+        win_h = self.debug_window.winfo_height()
+        if win_w < 50: win_w = 600
+        if win_h < 50: win_h = 400
+        
+        img_copy.thumbnail((win_w, win_h))
+        self.tk_img = ImageTk.PhotoImage(img_copy) 
+        
+        self.debug_label.config(image=self.tk_img)
 
     def start(self):
         task = self.entry.get()
         if not task: return messagebox.showwarning("Error", "Enter a task!")
         try: steps = int(self.steps_spin.get())
         except: steps = 15
-        self.worker = AgentWorker(self.log, self.ocr)
+        
+        self.worker = AgentWorker(self.log, self.update_debug_image, self.ocr)
+        
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.entry.config(state=tk.DISABLED)
